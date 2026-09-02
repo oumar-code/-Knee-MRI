@@ -8,6 +8,9 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
 from tqdm import tqdm
+import subprocess
+import sys
+import glob
 
 from challenges.kaggle_knee_mri.data.dataset import StudySliceDataset
 from challenges.kaggle_knee_mri.models.baseline import SliceModel
@@ -15,13 +18,19 @@ from challenges.kaggle_knee_mri.models.baseline import SliceModel
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--csv', type=str, required=True, help='CSV with columns: study_path, labels (as 12 comma-separated values), group (StudyInstanceUID)')
+    p.add_argument('--csv', type=str, default=None, help='CSV with columns: study_path, labels (as 12 semicolon-separated values), group')
+    p.add_argument('--dicom-root', type=str, default=None, help='If provided, will run preprocessing to produce per-study .npz files')
+    p.add_argument('--preprocessed-dir', type=str, default='data/preprocessed', help='Directory where .npz preprocessed volumes are stored or will be written')
+    p.add_argument('--labels-csv', type=str, default=None, help='Optional CSV mapping StudyInstanceUID to 12 labels and group info (columns: study_uid, ACL, MCL, ..., group(optional))')
+    p.add_argument('--keywords', type=str, default='sagittal,pd', help='Preferred series keywords passed to preprocess step')
+    p.add_argument('--target-size', type=int, nargs=2, default=[320, 320])
     p.add_argument('--n_slices', type=int, default=16)
     p.add_argument('--backbone', type=str, default='tf_efficientnet_b3')
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--outdir', type=str, default='checkpoints')
     p.add_argument('--fold', type=int, default=0)
+    p.add_argument('--auto-preprocess', action='store_true', help='If set and dicom-root provided, run preprocessing for missing studies')
     return p.parse_args()
 
 
@@ -36,7 +45,88 @@ def collate_fn(batch):
     return xs, ys
 
 
+def run_preprocess(dicom_root: str, out_dir: str, keywords: str, target_size: list):
+    """Call the preprocess.py script to generate preprocessed .npz files.
+    This runs the existing CLI script in the repository using the same Python interpreter.
+    """
+    script_path = os.path.join(os.path.dirname(__file__), '..', 'preprocess.py')
+    script_path = os.path.abspath(script_path)
+    cmd = [sys.executable, script_path, '--dicom-root', dicom_root, '--out-dir', out_dir,
+           '--keywords', keywords, '--target-size', str(target_size[0]), str(target_size[1])]
+    print('Running preprocess:', ' '.join(cmd))
+    subprocess.check_call(cmd)
+
+
+def build_train_csv_from_preprocessed(preprocessed_dir: str, labels_csv: str = None, out_csv: str = 'train_entries.csv'):
+    """Create a CSV with columns: study_path, labels (semicolon-separated 12), group
+
+    If labels_csv is provided, it should contain a column 'study_uid' and the 12 label columns in the same order as the README.
+    If group column is missing, group defaults to study_uid.
+    If labels_csv is not provided, labels default to zeros (placeholder) and group=study_uid.
+    """
+    pre_dir = Path(preprocessed_dir)
+    files = sorted(pre_dir.glob('*.npz'))
+    rows = []
+    labels_df = None
+    if labels_csv is not None and Path(labels_csv).exists():
+        labels_df = pd.read_csv(labels_csv)
+        # expect study_uid column
+        if 'study_uid' not in labels_df.columns:
+            # try common alternatives
+            if 'StudyInstanceUID' in labels_df.columns:
+                labels_df = labels_df.rename(columns={'StudyInstanceUID': 'study_uid'})
+            else:
+                raise ValueError('labels_csv must contain study_uid or StudyInstanceUID column')
+        labels_df = labels_df.set_index('study_uid')
+
+    for f in files:
+        study_uid = f.stem
+        study_path = str(f)
+        if labels_df is not None and study_uid in labels_df.index:
+            row = labels_df.loc[study_uid]
+            # attempt to collect 12 label columns (non-group)
+            # if labels are already in single column 'labels' with semicolon, use that
+            if 'labels' in row.index:
+                lab_str = str(row['labels'])
+            else:
+                # pick numeric columns (not group)
+                numeric_cols = [c for c in labels_df.columns if labels_df[c].dtype.kind in 'fi' or labels_df[c].dtype == object]
+                # remove potential 'group' column if present
+                if 'group' in numeric_cols:
+                    numeric_cols.remove('group')
+                vals = []
+                # If exactly 12 columns are present, use first 12
+                for c in numeric_cols[:12]:
+                    vals.append(str(row[c]))
+                lab_str = ';'.join(vals)
+            group = row['group'] if 'group' in row.index else study_uid
+        else:
+            lab_str = ';'.join(['0'] * 12)
+            group = study_uid
+        rows.append({'study_path': study_path, 'labels': lab_str, 'group': group})
+
+    out_df = pd.DataFrame(rows)
+    out_df.to_csv(out_csv, index=False)
+    print(f'Wrote training CSV with {len(out_df)} rows to {out_csv}')
+    return out_csv
+
+
 def train_fold(args):
+    # If auto-preprocess requested, run preprocessing for missing studies
+    if args.auto_preprocess and args.dicom_root:
+        os.makedirs(args.preprocessed_dir, exist_ok=True)
+        try:
+            run_preprocess(args.dicom_root, args.preprocessed_dir, args.keywords, args.target_size)
+        except subprocess.CalledProcessError as e:
+            print('Preprocessing step failed:', e)
+            raise
+
+    # If csv not provided, build from preprocessed dir (using optional labels_csv)
+    if args.csv is None:
+        os.makedirs(args.preprocessed_dir, exist_ok=True)
+        generated_csv = os.path.join(args.preprocessed_dir, 'train_entries.csv')
+        args.csv = build_train_csv_from_preprocessed(args.preprocessed_dir, args.labels_csv, out_csv=generated_csv)
+
     df = pd.read_csv(args.csv)
     # expect df columns: study_path, labels (as string '0;1;0;...'), group
     entries = df['study_path'].tolist()
