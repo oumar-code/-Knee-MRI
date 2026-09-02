@@ -1,20 +1,15 @@
 """Preprocess DICOM studies into per-study .npz volumes.
 
+This updated version sorts slices by ImagePositionPatient (z) when available and
+saves per-study metadata alongside the image stack: pixel_spacing, slice_thickness,
+and image_positions.
+
 Usage example:
     python challenges/kaggle-knee-mri/preprocess.py \
         --dicom-root /path/to/raw_dicom_root \
         --out-dir data/preprocessed \
         --target-size 320 320 \
         --keywords sagittal,PD
-
-What this script does:
-- Walks the given dicom_root and groups DICOM files by StudyInstanceUID and SeriesInstanceUID.
-- For each study, selects one series using a keyword-ranked heuristic (or the largest series if none match).
-- Loads the selected series (pixel arrays), applies percentile clipping + z-score normalization, resizes slices to target size (if Pillow is available), and saves each study as a compressed .npz file containing an array shape (S, H, W).
-
-Notes:
-- The loader currently sorts files by InstanceNumber if available, else by filename. This should be robust but may be adjusted to use ImagePositionPatient for better ordering.
-- The script attempts to be resilient: it will skip series that fail to read and continue.
 """
 
 from pathlib import Path
@@ -23,7 +18,6 @@ import pydicom
 import numpy as np
 from collections import defaultdict
 import sys
-import math
 
 try:
     from PIL import Image
@@ -34,35 +28,70 @@ except Exception:
 
 def load_series_files(file_paths):
     """Load list of DICOM files into a numpy volume (S, H, W).
-    Order by InstanceNumber when available, else filename.
+    Order by ImagePositionPatient (z) when available, else by InstanceNumber,
+    else by filename.
+    Returns (vol, pixel_spacing, slice_thickness, image_positions)
     """
     slices = []
-    meta_list = []
     for p in sorted(file_paths):
         try:
             ds = pydicom.dcmread(str(p), stop_before_pixels=False)
             arr = ds.pixel_array.astype('float32')
+            # extract z if ImagePositionPatient exists
+            z = None
+            if hasattr(ds, 'ImagePositionPatient'):
+                try:
+                    z = float(ds.ImagePositionPatient[2])
+                except Exception:
+                    z = None
             instance = getattr(ds, 'InstanceNumber', None)
-            slices.append((instance, arr, p))
+            slices.append({'path': p, 'ds': ds, 'arr': arr, 'z': z, 'instance': instance})
         except Exception as e:
             print(f"Warning: failed to read {p}: {e}", file=sys.stderr)
     if len(slices) == 0:
         raise RuntimeError('No readable DICOM slices in series')
-    # sort by InstanceNumber if available
-    if any(s[0] is not None for s in slices):
-        slices = sorted(slices, key=lambda x: (x[0] if x[0] is not None else 0))
+    # Determine ordering key
+    if any(s['z'] is not None for s in slices):
+        # sort by z coordinate
+        slices = sorted(slices, key=lambda x: x['z'])
+    elif any(s['instance'] is not None for s in slices):
+        slices = sorted(slices, key=lambda x: (x['instance'] if x['instance'] is not None else 0))
     else:
-        # already sorted by filename
+        # keep filename order
         pass
-    arrs = [s[1] for s in slices]
+    arrs = [s['arr'] for s in slices]
     vol = np.stack(arrs, axis=0)
-    return vol
+    # pixel spacing and slice thickness
+    ds0 = slices[0]['ds']
+    pixel_spacing = None
+    if hasattr(ds0, 'PixelSpacing'):
+        try:
+            pixel_spacing = [float(x) for x in ds0.PixelSpacing]
+        except Exception:
+            pixel_spacing = None
+    slice_thickness = None
+    if hasattr(ds0, 'SliceThickness'):
+        try:
+            slice_thickness = float(ds0.SliceThickness)
+        except Exception:
+            slice_thickness = None
+    # image positions
+    image_positions = []
+    for s in slices:
+        ds = s['ds']
+        if hasattr(ds, 'ImagePositionPatient'):
+            try:
+                image_positions.append([float(x) for x in ds.ImagePositionPatient])
+            except Exception:
+                image_positions.append([0.0, 0.0, float(s['z']) if s['z'] is not None else 0.0])
+        else:
+            image_positions.append([0.0, 0.0, float(s['z']) if s['z'] is not None else 0.0])
+    return vol, pixel_spacing, slice_thickness, np.array(image_positions)
 
 
 def normalize_volume(vol, clip_percentiles=(0.5, 99.5)):
     p0, p1 = np.percentile(vol, clip_percentiles)
     vol = np.clip(vol, p0, p1)
-    # z-score per-volume
     mean = vol.mean()
     std = vol.std()
     if std < 1e-6:
@@ -78,7 +107,6 @@ def resize_volume(vol, target_h, target_w):
         out = np.zeros((S, target_h, target_w), dtype=vol.dtype)
         for i in range(S):
             slice_i = vol[i]
-            # simple center-crop or pad
             start_h = max(0, (H - target_h) // 2)
             start_w = max(0, (W - target_w) // 2)
             crop = slice_i[start_h:start_h+target_h, start_w:start_w+target_w]
@@ -89,7 +117,6 @@ def resize_volume(vol, target_h, target_w):
     out = np.zeros((S, target_h, target_w), dtype='float32')
     for i in range(S):
         arr = vol[i]
-        # scale arr to 0-255 for PIL
         amin = float(arr.min())
         amax = float(arr.max())
         if (amax - amin) < 1e-6:
@@ -100,7 +127,6 @@ def resize_volume(vol, target_h, target_w):
             img = Image.fromarray(scaled)
         img = img.resize((target_w, target_h), resample=Image.BILINEAR)
         arr2 = np.asarray(img).astype('float32') / 255.0
-        # restore approximate original scale (keep normalized behavior)
         out[i] = arr2
     return out
 
@@ -123,29 +149,22 @@ def find_dicom_series(dicom_root: Path):
                 studies[study_uid][series_uid]['desc'] = series_desc
                 studies[study_uid][series_uid]['files'].append(p)
             except Exception:
-                # ignore files that are not DICOM or cannot be parsed
                 continue
     return studies
 
 
 def pick_series_for_study(series_dict, keywords=None):
-    """Pick a series UID from series_dict using keywords ranking; fallback to largest series.
-
-    keywords: list of lowercase substrings to prefer (order defines priority)
-    """
     if keywords is None:
         keywords = []
-    # score series by keyword matches
     scores = []
     for sid, info in series_dict.items():
         desc = (info.get('desc') or '').lower()
         score = 0
         for i, kw in enumerate(keywords):
             if kw in desc:
-                score = len(keywords) - i  # earlier keywords higher score
+                score = len(keywords) - i
                 break
         scores.append((score, len(info['files']), sid))
-    # choose max by (score, n_files)
     scores = sorted(scores, key=lambda x: (x[0], x[1]), reverse=True)
     if len(scores) == 0:
         return None
@@ -187,12 +206,12 @@ def main():
             continue
         files = series_map[sid]['files']
         try:
-            vol = load_series_files(files)
+            vol, pixel_spacing, slice_thickness, image_positions = load_series_files(files)
             vol = normalize_volume(vol, clip_percentiles=tuple(args.clip_percentiles))
             if args.target_size is not None:
                 vol = resize_volume(vol, args.target_size[0], args.target_size[1])
-            # save as compressed npz
-            np.savez_compressed(str(out_path), vol)
+            # save as compressed npz with metadata
+            np.savez_compressed(str(out_path), images=vol.astype('float32'), pixel_spacing=np.array(pixel_spacing) if pixel_spacing is not None else np.array([0.0,0.0]), slice_thickness=float(slice_thickness) if slice_thickness is not None else 0.0, image_positions=image_positions)
             processed += 1
             if processed % 50 == 0:
                 print(f'Processed {processed} studies...')
